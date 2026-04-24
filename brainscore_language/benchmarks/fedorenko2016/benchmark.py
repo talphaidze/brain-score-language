@@ -1,3 +1,4 @@
+import numpy as np
 import xarray as xr
 
 from brainscore_core.benchmarks import BenchmarkBase
@@ -59,6 +60,7 @@ class Fedorenko2016(BenchmarkBase):
             stimuli_values = sentence_stimuli.values
             sentence_predictions = candidate.digest_text(stimuli_values)["neural"]
             sentence_predictions['stimulus_id'] = 'presentation', sentence_stimuli['stimulus_id'].values
+            sentence_predictions['sentence_id'] = 'presentation', sentence_stimuli['sentence_id'].values
             predictions.append(sentence_predictions)
             
         scores = {}

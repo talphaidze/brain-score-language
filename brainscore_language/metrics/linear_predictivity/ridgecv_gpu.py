@@ -208,6 +208,8 @@ class RidgeGCVTorch:
         dtype: torch.dtype = torch.float64,
         pbar: bool = False,
         store_results_gpu: bool = True, #adds ability to NOT store cv_results_ on GPU to save VRAM (originally on GPU)
+        normalpha: bool = True,
+        single_alpha: bool = True
     ):
         self.alphas = np.asarray(alphas) if not np.isscalar(alphas) else np.array(alphas)
         self.fit_intercept = fit_intercept
@@ -221,6 +223,9 @@ class RidgeGCVTorch:
         self.dtype = dtype
         self.pbar = pbar
         self.store_results_gpu = store_results_gpu
+        self.normalpha = normalpha
+        self.single_alpha = single_alpha
+
 
         # learned attributes
         self.alpha_ = None
@@ -459,6 +464,11 @@ class RidgeGCVTorch:
 
         n_y = 1 if yp.ndim == 1 else yp.shape[1]
         alphas_vec = torch.atleast_1d(_as_torch(self.alphas, device=Xp.device, dtype=Xp.dtype))
+
+        if self.normalpha:
+            largest_sv = torch.linalg.svdvals(Xp)[0]
+            alphas_vec = alphas_vec * largest_sv
+
         n_alphas = int(alphas_vec.numel())
 
         if self.store_cv_results:
@@ -481,7 +491,17 @@ class RidgeGCVTorch:
         for i, alpha in alpha_iter:
             Ginv_diag, c = solve(float(alpha.item()), yp, sqrt_sw, X_mean, *decomp)
 
-            if self.scoring is None:
+            if self.single_alpha and n_y > 1:
+                # LOO predictions for this alpha
+                loo_preds = yp - (c / Ginv_diag)
+                # Pearson r per voxel between LOO predictions and actual y
+                loo_m = loo_preds - loo_preds.mean(dim=0, keepdim=True)
+                yp_m = yp - yp.mean(dim=0, keepdim=True)
+                num = (loo_m * yp_m).sum(dim=0)
+                den = torch.sqrt((loo_m**2).sum(dim=0) * (yp_m**2).sum(dim=0)) + 1e-8
+                per_voxel_r = num / den  # shape [n_targets]
+                alpha_score = per_voxel_r.mean()  # single scalar: mean r across voxels
+            elif self.scoring is None:
                 squared_errors = (c / Ginv_diag) ** 2
                 if self.alpha_per_target and n_y > 1:
                     alpha_score = -squared_errors.mean(dim=0)
@@ -603,7 +623,10 @@ class RidgeGCVTorch:
                 bias = _as_torch(bias, device=X.device, dtype=X.dtype)
             yhat = yhat + bias
         self.to_device("cpu", predict_only=True)
-        return _to_numpy(yhat)
+        result = _to_numpy(yhat)
+        if result.ndim == 1:
+            result = result.reshape(-1, 1)
+        return result
 
     def to_device(self, device, predict_only: bool = False):
         """

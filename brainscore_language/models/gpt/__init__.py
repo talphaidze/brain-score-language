@@ -12,7 +12,7 @@ model_registry['distilgpt2'] = lambda: HuggingfaceSubject(model_id='distilgpt2',
     ArtificialSubject.RecordingTarget.language_system: 'transformer.h.5'})
 
 model_registry['gpt2'] = lambda: HuggingfaceSubject(model_id='gpt2', region_layer_mapping={
-    ArtificialSubject.RecordingTarget.language_system: 'transformer.h.11'})
+    ArtificialSubject.RecordingTarget.language_system: 'transformer.h.8'})
 
 model_registry['gpt2-medium'] = lambda: HuggingfaceSubject(model_id='gpt2-medium', region_layer_mapping={
     ArtificialSubject.RecordingTarget.language_system: 'transformer.h.22'})

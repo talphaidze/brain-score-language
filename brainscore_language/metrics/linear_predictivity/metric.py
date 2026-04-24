@@ -182,7 +182,10 @@ class CrossRegressedCorrelation(Metric):
         score.attrs['raw_regression_intercept'] = intercept
 
     def aggregate(self, scores):
-        return scores.median(dim='neuroid')
+        result = scores.mean(dim='neuroid')
+        result.attrs['raw'] = scores
+        return result
+        #return scores.median(dim='neuroid')
 
 
 class ScaledCrossRegressedCorrelation(Metric):
@@ -197,7 +200,8 @@ class ScaledCrossRegressedCorrelation(Metric):
         return self.cross_regressed_correlation(source, target)
 
 def ridge_regression(xarray_kwargs=None):
-    regression = RidgeGCVTorch(alphas=np.logspace(-3, 3, 7))
+    #regression = RidgeGCVTorch(alphas=np.logspace(-3, 3, 7))
+    regression = RidgeGCVTorch(alphas=np.logspace(-1, 8, 10))
     xarray_kwargs = xarray_kwargs or {}
     regression = XarrayRegression(regression, **xarray_kwargs)
     return regression

@@ -53,6 +53,9 @@ def _run_score(model_identifier: str, benchmark_identifier: str) -> Score:
     model: ArtificialSubject = load_model(model_identifier)
     benchmark: Benchmark = load_benchmark(benchmark_identifier)
     score: Score = benchmark(model)
+    score = benchmark(model)
+    if isinstance(score, dict):
+        score = next(iter(score.values()))
     score.attrs['model_identifier'] = model_identifier
     score.attrs['benchmark_identifier'] = benchmark_identifier
     return score

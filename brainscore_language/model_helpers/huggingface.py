@@ -18,6 +18,11 @@ from brainscore_language.artificial_subject import ArtificialSubject
 from brainscore_language.model_helpers.preprocessing import prepare_context
 from brainscore_language.utils import fullname
 from brainscore_language.model_helpers.localize import localize_fed10
+from brainscore_language.utils.downsampling import downsample
+from brainscore_language.utils.fir import apply_fir_delays
+
+#we import feature cache util
+from brainscore_language.utils.feature_cache import FeatureCache
 
 
 class HuggingfaceSubject(ArtificialSubject):
@@ -30,6 +35,8 @@ class HuggingfaceSubject(ArtificialSubject):
             use_localizer=False,
             localizer_kwargs=None,
             task_heads: Union[None, Dict[ArtificialSubject.Task, Callable]] = None,
+            # add a feature cache arg
+            feature_cache_dir: Union[None, str] = None
     ):
         """
             :param model_id: the model id i.e. name
@@ -56,9 +63,13 @@ class HuggingfaceSubject(ArtificialSubject):
         self._logger.info(f"Using device: {self.device}")
         print(f"Using device: {self.device}")
         self.basemodel.to(self.device)
+        self.basemodel.eval()
+        # if self.device != 'cpu':
+        #     self.basemodel.bfloat16()  # use bfloat16 for faster inference; works on both CUDA and MPS
+            
         self.tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(self.model_id,
                                                                                                truncation_side='left')
-        self.current_tokens = None  # keep track of current tokens
+        self.current_tokens = None  # keep track of current tokenswait
         self._tokenizer_returns_overflow: Union[None, bool] = None
         """ whether the tokenizer can return overflowing tokens. `None` initially before inferring tokenizer type """
 
@@ -82,6 +93,9 @@ class HuggingfaceSubject(ArtificialSubject):
                 device=self.device
             ).flatten()
 
+        # we instantiate the feature cache here, and pass it to the HuggingfaceSubject, which will use it in digest_text when extracting features
+        self.feature_cache = FeatureCache(cache_dir=feature_cache_dir) if feature_cache_dir is not None else None
+
     def identifier(self):
         return self.model_id
 
@@ -94,7 +108,7 @@ class HuggingfaceSubject(ArtificialSubject):
                                recording_type: ArtificialSubject.RecordingType):
         self.neural_recordings.append((recording_target, recording_type))
 
-    def digest_text(self, text: Union[str, List[str]]) -> Dict[str, DataAssembly]:
+    def digest_text(self, text: Union[str, List[str]], data_times=None, tr_times=None) -> Dict[str, DataAssembly]:
         """
         :param text: the text to be used for inference e.g. "the quick brown fox"
         :return: assembly of either behavioral output or internal neural representations
@@ -103,30 +117,109 @@ class HuggingfaceSubject(ArtificialSubject):
         if type(text) == str:
             text = [text]
 
+        # Check feature cache - if hit, skip the entire forward pass
+        if self.feature_cache and self.neural_recordings:
+            cache_layers = []
+            for (recording_target, recording_type) in self.neural_recordings:
+                layers = self.region_layer_mapping[recording_target]
+                if type(layers) == str:
+                    layers = [layers]
+                cache_layers.extend(layers)
+            cached = self.feature_cache.load(self.model_id, text, cache_layers)
+            if cached is not None:
+                output = {'behavior': None, 'neural': cached}
+                return self._post_process(output, data_times=data_times, tr_times=tr_times)
+
         output = {'behavior': [], 'neural': []}
         number_of_tokens = 0
 
         text_iterator = tqdm(text, desc='digest text') if len(text) > 100 else text  # show progress bar if many parts
+
+        past_key_values = None  # for kv caching
+
         for part_number, text_part in enumerate(text_iterator):
+            stimuli_coords = {
+                'stimulus': ('presentation', [text_part]),
+                'context': ('presentation', ['']),
+                'part_number': ('presentation', [part_number]),
+            }
+
+            # handle empty TRs by outputting zeros instead of running the model
+            if text_part.strip() == '':
+                if self.neural_recordings:
+                    output['neural'].append(self._make_zero_representations(stimuli_coords))
+                past_key_values = None  # reset cache since sequence is broken by empty input
+                continue
+            
+            #TODO: ADD IT HERE
             # prepare string representation of context
-            context = prepare_context(text[:part_number + 1])
+            # current_context = text[part_number]
+            # context = prepare_context(text[:part_number + 1])
+
+            # context_words = current_context.split()
+            # for word_idx in range(len(context_words)):
+            #     context = prepare_context(text[:part_number] + [context_words[:word_idx+1]])
+
+            context = prepare_context(text[:part_number + 1]) 
+            stimuli_coords['context'] = ('presentation', [context]) 
             context_tokens, number_of_tokens = self._tokenize(context, number_of_tokens)
+
+            # max_context_tokens = 128
+            # start = max(0, part_number - max_context_tokens)
+            # context = prepare_context(text[start:part_number + 1])
+            # stimuli_coords['context'] = ('presentation', [context])
+            # context_tokens, number_of_tokens = self._tokenize(context, 0)
+            # past_key_values = None  # reset cache for each new context
+            #context_tokens, number_of_tokens = self._tokenize(context, number_of_tokens)
+
+            words = text_part.split()
+            if len(words) > 1:
+                word_last_positions = []
+                for i in range(len(words)):
+                    prefix = ' '.join(words[:i + 1])
+                    prefix_tokens = self.tokenizer(prefix)
+                    word_last_positions.append(len(prefix_tokens['input_ids']) - 1)
+                self.word_last_positions = None #word_last_positions - currently commented out on purspose
+            else:
+                self.word_last_positions = None #single word, just use last token as before
+            
 
             # prepare recording hooks
             hooks, layer_representations = self._setup_hooks()
 
-            # run and remove hooks
+            max_len = getattr(self.basemodel.config, 'max_position_embeddings', None)
+            if max_len and past_key_values is not None:
+                cache_len = past_key_values.get_seq_length()  # sequence length in cache
+                new_tokens_len = self.current_tokens['input_ids'].shape[-1]
+                if cache_len + new_tokens_len > max_len:
+                    past_key_values = None  # reset cache
+
+            #here we implement torch no grad with kv caching
             with torch.no_grad():
-                base_output = self.basemodel(**context_tokens)
+                if past_key_values is not None:
+                    input_ids = self.current_tokens['input_ids'].to(self.device)
+                else:
+                    input_ids = context_tokens['input_ids'].to(self.device)
+
+                base_output = self.basemodel(
+                    input_ids = input_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
+                past_key_values = base_output.past_key_values
+
+            # run and remove hooks
+            # with torch.no_grad():
+            #     base_output = self.basemodel(**context_tokens)
             for hook in hooks:
                 hook.remove()
 
             # format output
-            stimuli_coords = {
-                'stimulus': ('presentation', [text_part]),
-                'context': ('presentation', [context]),
-                'part_number': ('presentation', [part_number]),
-            }
+            # stimuli_coords = {
+            #     'stimulus': ('presentation', [text_part]),
+            #     'context': ('presentation', [context]),
+            #     'part_number': ('presentation', [part_number]),
+            # }
             if self.behavioral_task:
                 behavioral_output = self.output_to_behavior(base_output=base_output)
                 behavior = BehavioralAssembly(
@@ -145,12 +238,85 @@ class HuggingfaceSubject(ArtificialSubject):
             if output['behavior'] else None
         output['neural'] = xr.concat(output['neural'], dim='presentation').sortby('part_number') \
             if output['neural'] else None
-        
+
+        # Save raw features to cache (before FIR/localizer)
+        if self.feature_cache and output['neural'] is not None:
+            cache_layers = []
+            for (recording_target, recording_type) in self.neural_recordings:
+                layers = self.region_layer_mapping[recording_target]
+                if type(layers) == str:
+                    layers = [layers]
+                cache_layers.extend(layers)
+            self.feature_cache.save(self.model_id, text, cache_layers, output['neural'])
+
+        return self._post_process(output, data_times=data_times, tr_times=tr_times)
+
+    def _post_process(self, output, data_times=None, tr_times=None):
         if self.neural_recordings and self.use_localizer:
             num_presentations = output['neural'].data.shape[0]
             output['neural-mask'] = output['neural'].copy()
             output['neural-mask'].data = np.repeat(self.language_mask[np.newaxis,:], num_presentations, axis=0)
             output['neural'] = output['neural'].where(output['neural-mask'], drop=True)
+
+        # Apply FIR delay stacking when timing info is provided
+        if self.neural_recordings and output['neural'] is not None:
+            neural = output['neural']
+            n_delays = 4
+
+            if data_times is not None and tr_times is not None:
+                #this chunk is for word by word
+                downsampled = downsample(
+                    neural.values,
+                    data_times=data_times,
+                    tr_times=tr_times,
+                    method='sum' #can be changed as needed, e.g. 'lanczos' or 'average'
+                )
+                delayed = apply_fir_delays(downsampled, n_delays=n_delays)
+                n_trs = len(tr_times)
+                pres_coords = {
+                    'part_number': ('presentation', np.arange(n_trs)),    
+                }
+
+            #delayed = apply_fir_delays(neural.values, n_delays=n_delays)
+
+            # Rebuild neuroid coordinates
+            orig_neuroid_coords = {
+                c: neural[c].values
+                for c in neural.coords
+                if neural[c].dims == ('neuroid',) and c != 'neuroid'
+            }
+            n_orig_features = neural.sizes['neuroid']
+
+            neuroid_coords = {}
+            for c, vals in orig_neuroid_coords.items():
+                neuroid_coords[c] = (
+                    'neuroid',
+                    np.concatenate([
+                        [f"{v}_d{d}" if c == 'neuroid_id' else v
+                        for v in vals]
+                        for d in range(1, n_delays + 1)
+                    ])
+                )
+            neuroid_coords['delay'] = (
+                'neuroid',
+                np.concatenate([
+                    np.full(n_orig_features, d)
+                    for d in range(1, n_delays + 1)
+                ])
+            )
+
+            # Preserve presentation coords
+            # pres_coords = {
+            #     c: ('presentation', neural[c].values)
+            #     for c in neural.coords
+            #     if neural[c].dims == ('presentation',)
+            # }
+
+            output['neural'] = NeuroidAssembly(
+                delayed,
+                dims=['presentation', 'neuroid'],
+                coords={**pres_coords, **neuroid_coords},
+            )
                     
         return output
 
@@ -233,10 +399,45 @@ class HuggingfaceSubject(ArtificialSubject):
         return hooks, layer_representations
 
     def output_to_representations(self, layer_representations: Dict[Tuple[str, str, str], np.ndarray], stimuli_coords):
-        representation_values = np.concatenate([
-            # Choose to use last token (-1) of values[batch, token, unit] to represent passage.
-            values[:, -1:, :].squeeze(0).cpu() for values in layer_representations.values()],
-            axis=-1)  # concatenate along neuron axis
+        # representation_values = np.concatenate([
+        #     # Choose to use last token (-1) of values[batch, token, unit] to represent passage.
+        #     #TODO: instead of having last word token in a sequence we will add
+        #     # last token of a word and then we will combine these embeddings with a lanczos in each tr
+        #     # we only want tokens that corrspond to a specific tr, not outside
+        #     # k embeddings and lanczos on k embeddings to get one embedding per tr
+            
+        #     values[:, -1:, :].squeeze(0).float().cpu() for values in layer_representations.values()],
+        #     axis=-1)  # concatenate along neuron axis
+
+        #apply lanczos here on the repserentations that we get here
+        if self.word_last_positions is not None:
+            # positions are relative to text_part; offset if values contains full context
+            seq_len = list(layer_representations.values())[0].shape[1]
+            n_text_tokens = self.current_tokens['input_ids'].shape[-1]
+            offset = seq_len - n_text_tokens
+            positions = [min(p + offset, seq_len - 1) for p in self.word_last_positions]
+            # n_words = len(positions)
+            # data_times = np.linspace(0, 1, n_words)
+            # tr_times = np.array([0.5])
+
+            # representation_values = np.concatenate([
+            #     downsample(
+            #         values[0, positions, :].float().cpu().numpy(),
+            #         data_times, tr_times, method='lanczos'
+            #     )
+            #     for values in layer_representations.values()
+            # ], axis=-1)  # concatenate along neuron axis
+            representation_values = np.concatenate([
+                values[0, positions, :].float().cpu().numpy().mean(axis=0, keepdims=True)
+                for values in layer_representations.values()
+            ], axis=-1)
+
+        else:
+            representation_values = np.concatenate([
+                # Choose to use last token (-1) of values[batch, token, unit] to represent passage.
+                values[:, -1:, :].squeeze(0).float().cpu() for values in layer_representations.values()],
+                axis=-1)  # concatenate along neuron axis
+
         neuroid_coords = {
             'layer': ('neuroid', np.concatenate([[layer] * values.shape[-1]
                                                  for (recording_target, recording_type, layer), values
@@ -257,6 +458,45 @@ class HuggingfaceSubject(ArtificialSubject):
             coords={**stimuli_coords, **neuroid_coords},
             dims=['presentation', 'neuroid'])
         return representations
+
+    def _make_zero_representations(self, stimuli_coords):
+        """Create a zero-valued NeuroidAssembly for empty stimuli (silent TRs)."""
+        layer_info = []
+        for (recording_target, recording_type) in self.neural_recordings:
+            layer_names = self.region_layer_mapping[recording_target]
+            if type(layer_names) == str:
+                layer_names = [layer_names]
+            # For each layer, get the hidden size from the model config (768 for distilgpt2).
+            # Store a tuple with the metadata we'll need for coordinates. 
+            # With one layer, layer_info has one entry.
+            for layer_idx, layer_name in enumerate(layer_names):
+                hidden_size = self.basemodel.config.hidden_size
+                layer_info.append((f"{recording_target}.{layer_idx}", recording_type, layer_name, hidden_size))
+
+        total_neuroids = sum(info[3] for info in layer_info)
+        zero_values = np.zeros((1, total_neuroids))
+
+        neuroid_coords = {
+            'layer': ('neuroid', np.concatenate([[layer_name] * size
+                                                 for (_, _, layer_name, size) in layer_info])),
+            'region': ('neuroid', np.concatenate([[rec_target] * size
+                                                  for (rec_target, _, _, size) in layer_info])),
+            'recording_type': ('neuroid', np.concatenate([[rec_type] * size
+                                                          for (_, rec_type, _, size) in layer_info])),
+            'neuron_number_in_layer': ('neuroid', np.concatenate(
+                [np.arange(size) for (_, _, _, size) in layer_info])),
+        }
+
+        # Create unique IDs like 'transformer.h.5--0', 'transformer.h.5--1', ..., 'transformer.h.5--767'.
+        # defchararray.add concatenates string arrays element-wise. functools.reduce chains the three parts:
+        # layer name + '--' + neuron number.
+        neuroid_coords['neuroid_id'] = 'neuroid', functools.reduce(defchararray.add, [
+            neuroid_coords['layer'][1], '--', neuroid_coords['neuron_number_in_layer'][1].astype(str)])
+
+        return NeuroidAssembly(
+            zero_values,
+            coords={**stimuli_coords, **neuroid_coords},
+            dims=['presentation', 'neuroid'])
 
     def estimate_reading_times(self, base_output: CausalLMOutput):
         """
@@ -286,7 +526,7 @@ class HuggingfaceSubject(ArtificialSubject):
         # Note that this implementation similarly sums over the surprisal of multiple words,
         # e.g. for the surprisal of an entire sentence.
         cross_entropy = F.cross_entropy(predicted_logits, actual_tokens, reduction='sum') / np.log(2)
-        return cross_entropy.to('cpu')
+        return cross_entropy.float().to('cpu')
 
     def predict_next_word(self, base_output: CausalLMOutput):
         """

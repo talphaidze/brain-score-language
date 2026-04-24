@@ -63,23 +63,26 @@ class Split:
         unique_split_values = False
         random_state = 1
         kfold = "group"
+        shuffle = True
 
     def __init__(self,
                  splits=Defaults.splits, train_size=None, test_size=None,
                  split_coord=Defaults.split_coord, stratification_coord=Defaults.stratification_coord, kfold=Defaults.kfold,
-                 unique_split_values=Defaults.unique_split_values, random_state=Defaults.random_state):
+                 shuffle=Defaults.shuffle, unique_split_values=Defaults.unique_split_values, random_state=Defaults.random_state):
         super().__init__()
+        if not shuffle:
+            random_state = None  # KFold and GroupKFold don't use random_state, but StratifiedKFold does, so we need to set it to None for all if shuffle is False
         if train_size is None and test_size is None:
             train_size = self.Defaults.train_size
 
         if kfold == "group":
-            self._split = GroupKFold(n_splits=splits, shuffle=True, random_state=random_state)
+            self._split = GroupKFold(n_splits=splits, shuffle=shuffle, random_state=random_state)
         elif kfold:
             assert (train_size is None or train_size == self.Defaults.train_size) and test_size is None
             if stratification_coord:
-                self._split = StratifiedKFold(n_splits=splits, shuffle=True, random_state=random_state)
+                self._split = StratifiedKFold(n_splits=splits, shuffle=shuffle, random_state=random_state)
             else:
-                self._split = KFold(n_splits=splits, shuffle=True, random_state=random_state)
+                self._split = KFold(n_splits=splits, shuffle=shuffle, random_state=random_state)
         else:
             if stratification_coord:
                 self._split = StratifiedShuffleSplit(

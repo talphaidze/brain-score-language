@@ -148,10 +148,15 @@ class ExtrapolationCeiling:
         return score
 
     def fit(self, subject_subsamples, bootstrapped_scores):
-        params, pcov = curve_fit(v, subject_subsamples, bootstrapped_scores,
-                                 # v (i.e. max ceiling) is between 0 and 1, tau0 unconstrained
-                                 bounds=([0, -np.inf], [1, np.inf]))
-        return params
+        try:                                                                                          
+            params, pcov = curve_fit(v, subject_subsamples, bootstrapped_scores,                      
+                                     # v (i.e. max ceiling) is between 0 and 1, tau0 unconstrained    
+                                     bounds=([0, -np.inf], [1, np.inf]),                              
+                                     maxfev=10000)                                                    
+            return params                                                                             
+        except RuntimeError:
+            # curve_fit failed to converge — fall back to max observed score                          
+            return [bootstrapped_scores.max(), 1.0]                              
 
 
 class HoldoutSubjectCeiling:
